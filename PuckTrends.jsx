@@ -52,6 +52,34 @@ const POSITIONS = ["C", "L", "R", "D"];
 const TEAMS = Array.from(new Set(PLAYER_DATA.map((p) => p.team))).sort();
 
 /* ============================= HELPERS (unchanged logic) ============================= */
+function normalizePlayerSearchText(value) {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function getPlayerNameSearchParts(name) {
+  const parts = normalizePlayerSearchText(name).split(" ").filter(Boolean);
+  const first = parts[0] || "";
+  const last = parts.length > 1 ? parts.slice(1).join(" ") : first;
+  const finalLastToken = parts.length > 1 ? parts[parts.length - 1] : first;
+  return { first, last, finalLastToken };
+}
+
+function playerNameMatchesSearch(name, query) {
+  const q = normalizePlayerSearchText(query);
+  if (!q) return true;
+  const { first, last, finalLastToken } = getPlayerNameSearchParts(name);
+  return first.startsWith(q) || last.startsWith(q) || finalLastToken.startsWith(q);
+}
+
+function playerSearchRank(player, query) {
+  const q = normalizePlayerSearchText(query);
+  const { first, last, finalLastToken } = getPlayerNameSearchParts(player.name);
+  if (first.startsWith(q)) return 0;
+  if (last.startsWith(q)) return 1;
+  if (finalLastToken.startsWith(q)) return 2;
+  return 3;
+}
+
 function fp(stats, weights) {
   if (!stats) return 0;
   return STAT_DEFS.reduce((sum, s) => sum + (stats[s.key] || 0) * (weights[s.key] || 0), 0);
@@ -649,7 +677,9 @@ function PlayerSearch({ onAdd, disabled, excludeIds }) {
   const results = useMemo(() => {
     if (!query.trim()) return [];
     const q = query.toLowerCase();
-    return PLAYER_DATA.filter((p) => !excludeIds.includes(p.id) && p.name.toLowerCase().includes(q)).slice(0, 8);
+    return PLAYER_DATA.filter((p) => !excludeIds.includes(p.id) && playerNameMatchesSearch(p.name, q))
+      .sort((a, b) => playerSearchRank(a, q) - playerSearchRank(b, q) || a.name.localeCompare(b.name))
+      .slice(0, 8);
   }, [query, excludeIds]);
 
   return (
@@ -721,7 +751,7 @@ function RankingsTab({ weights }) {
     let r = rows.filter((row) => {
       if (posFilter !== "ALL" && row.position !== posFilter) return false;
       if (teamFilter !== "ALL" && row.team !== teamFilter) return false;
-      if (search.trim() && !row.name.toLowerCase().includes(search.toLowerCase())) return false;
+      if (search.trim() && !playerNameMatchesSearch(row.name, search)) return false;
       return true;
     });
     r.sort((a, b) => {
