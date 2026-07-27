@@ -1,11 +1,11 @@
-import React, { useState, useMemo } from "react";
+import React, { useEffect, useState, useMemo } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as ChartTooltip, Legend,
   ResponsiveContainer, ReferenceLine
 } from "recharts";
 import {
   Search, TrendingUp, TrendingDown, Info, X, Star, ArrowUpDown, HelpCircle,
-  ChevronDown, Sparkles, Users
+  ChevronDown, Sparkles, Users, Shield
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
@@ -83,6 +83,30 @@ function teamNeutralStats(seasonStats, ctx) {
     sog: seasonStats.sog / ctx.offenseIdx,
     ppp: seasonStats.ppp / ctx.ppIdx,
   };
+}
+
+
+function getPlayerPhotoUrl(player) {
+  return `https://assets.nhle.com/mugs/nhl/20252026/${player.team}/${player.id}.png`;
+}
+
+function getTeamLogoUrl(team) {
+  return `https://assets.nhle.com/logos/nhl/svg/${team}_light.svg`;
+}
+
+function positionLabel(position) {
+  return { C: "Center", L: "Left Wing", R: "Right Wing", D: "Defense" }[position] || position;
+}
+
+function calculateAge(birthDate) {
+  if (!birthDate) return null;
+  const today = new Date();
+  const born = new Date(`${birthDate}T00:00:00`);
+  if (Number.isNaN(born.getTime())) return null;
+  let age = today.getFullYear() - born.getFullYear();
+  const monthDiff = today.getMonth() - born.getMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < born.getDate())) age -= 1;
+  return age;
 }
 
 function ordinal(n) {
@@ -669,7 +693,8 @@ function RankingsTab({ weights }) {
   const [sortKey, setSortKey] = useState("latestFP");
   const [sortDir, setSortDir] = useState("desc");
   const [page, setPage] = useState(0);
-  const pageSize = 25;
+  const [playerProfiles, setPlayerProfiles] = useState({});
+  const pageSize = 24;
 
   const rows = useMemo(() => {
     return PLAYER_DATA.map((p) => {
@@ -708,6 +733,38 @@ function RankingsTab({ weights }) {
 
   const paged = filtered.slice(page * pageSize, page * pageSize + pageSize);
   const maxPage = Math.max(0, Math.ceil(filtered.length / pageSize) - 1);
+
+  useEffect(() => {
+    const missing = paged.filter((row) => !playerProfiles[row.id]);
+    if (!missing.length) return;
+
+    let cancelled = false;
+    Promise.all(
+      missing.map((row) =>
+        fetch(`https://api-web.nhle.com/v1/player/${row.id}/landing`)
+          .then((response) => (response.ok ? response.json() : null))
+          .then((data) => [row.id, data])
+          .catch(() => [row.id, null])
+      )
+    ).then((entries) => {
+      if (cancelled) return;
+      setPlayerProfiles((current) => {
+        const next = { ...current };
+        entries.forEach(([id, data]) => {
+          next[id] = {
+            age: calculateAge(data?.birthDate),
+            team: data?.currentTeamAbbrev || rows.find((row) => row.id === id)?.team,
+            position: data?.position || rows.find((row) => row.id === id)?.position,
+          };
+        });
+        return next;
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [paged, playerProfiles, rows]);
 
   const headerBtn = (key, label, helpText) => (
     <button
@@ -788,51 +845,108 @@ function RankingsTab({ weights }) {
         <span className="text-xs text-slate-400 ml-auto">{filtered.length} skaters</span>
       </div>
 
-      <Card className="overflow-hidden py-0">
-        <div className="grid grid-cols-[2fr_0.6fr_0.6fr_0.9fr_0.9fr_0.9fr] gap-2 px-4 py-2 bg-slate-50 border-b border-slate-200">
-          <span className="text-[11px] font-bold uppercase tracking-wide text-slate-400">Player</span>
-          <span className="text-[11px] font-bold uppercase tracking-wide text-slate-400">Pos</span>
-          <span className="text-[11px] font-bold uppercase tracking-wide text-slate-400">Team</span>
-          {headerBtn("latestFP", "Last FP", "Fantasy points from their most recent season played.")}
-          {headerBtn("delta", "YoY", "Year-over-year change in fantasy points vs the prior season.")}
-          {headerBtn("projFP", "Proj FP", "Projected fantasy points for 2026-27.")}
-        </div>
-        {paged.length === 0 ? (
-          <div className="px-4 py-10 text-center text-sm text-slate-400">
-            No skaters match those filters. Try clearing the search or position/team filters.
+      <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
+        <div>
+          <p className="text-[11px] font-bold uppercase tracking-wide text-slate-400">Sort player cards</p>
+          <div className="mt-1 flex flex-wrap gap-3">
+            {headerBtn("latestFP", "Last FP", "Fantasy points from their most recent season played.")}
+            {headerBtn("delta", "YoY", "Year-over-year change in fantasy points vs the prior season.")}
+            {headerBtn("projFP", "Proj FP", "Projected fantasy points for 2026-27.")}
           </div>
-        ) : (
-          paged.map((row, idx) => (
-            <div
-              key={row.id}
-              className={`grid grid-cols-[2fr_0.6fr_0.6fr_0.9fr_0.9fr_0.9fr] gap-2 px-4 py-2 items-center text-sm ${
-                idx % 2 ? "bg-white" : "bg-slate-50/40"
-              }`}
-            >
-              <span className="font-semibold text-[#0B1F33] flex items-center gap-1.5">
-                {page === 0 && idx < 3 && <Star className="w-3.5 h-3.5 text-[#E8A33D] fill-[#E8A33D]" />}
-                {row.name}
-              </span>
-              <span className="text-slate-500">
-                <Badge variant="outline" className="font-mono">{row.position}</Badge>
-              </span>
-              <span className="text-slate-500">{row.team}</span>
-              <span className="font-mono tabular-nums font-semibold">{row.latestFP.toFixed(1)}</span>
-              <span
-                className={`font-mono tabular-nums font-semibold ${
-                  row.delta >= 0 ? "text-emerald-600" : "text-rose-600"
-                }`}
+        </div>
+        <div className="hidden sm:flex items-center gap-2 text-xs text-slate-400">
+          <Shield className="w-4 h-4" />
+          Photos and logos load from official NHL image assets.
+        </div>
+      </div>
+
+      {paged.length === 0 ? (
+        <Card>
+          <CardContent className="px-4 py-10 text-center text-sm text-slate-400">
+            No skaters match those filters. Try clearing the search or position/team filters.
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          {paged.map((row, idx) => {
+            const profile = playerProfiles[row.id] || {};
+            const team = profile.team || row.team;
+            const position = profile.position || row.position;
+            return (
+              <Card
+                key={row.id}
+                className="overflow-hidden border-slate-200 bg-white shadow-sm transition hover:-translate-y-0.5 hover:shadow-lg"
               >
-                {row.delta >= 0 ? "+" : ""}
-                {row.delta.toFixed(1)}
-              </span>
-              <span className="font-mono tabular-nums font-semibold text-[#1D6FA5]">
-                {row.projFP.toFixed(1)}
-              </span>
-            </div>
-          ))
-        )}
-      </Card>
+                <div className="relative min-h-[160px] bg-gradient-to-br from-[#0B1F33] via-[#123451] to-[#1D6FA5] px-4 pt-4 text-white">
+                  <div className="absolute right-3 top-3 rounded-full bg-white/90 p-2 shadow-sm">
+                    <img
+                      src={getTeamLogoUrl(team)}
+                      alt={`${team} logo`}
+                      className="h-10 w-10 object-contain"
+                      loading="lazy"
+                    />
+                  </div>
+                  <div className="flex items-start gap-4 pr-14">
+                    <div className="relative h-28 w-28 shrink-0 overflow-hidden rounded-2xl border border-white/25 bg-white/10 shadow-inner">
+                      <img
+                        src={getPlayerPhotoUrl({ ...row.player, team })}
+                        alt={`${row.name} headshot`}
+                        className="h-full w-full object-cover object-top"
+                        loading="lazy"
+                        onError={(event) => {
+                          event.currentTarget.onerror = null;
+                          event.currentTarget.src = `https://assets.nhle.com/mugs/nhl/20242025/${team}/${row.id}.png`;
+                        }}
+                      />
+                    </div>
+                    <div className="min-w-0 pt-1">
+                      <div className="mb-2 flex items-center gap-2">
+                        {page === 0 && idx < 3 && <Star className="w-4 h-4 text-[#E8A33D] fill-[#E8A33D]" />}
+                        <Badge className="bg-white/15 text-white hover:bg-white/20">#{page * pageSize + idx + 1}</Badge>
+                      </div>
+                      <h3 className="text-2xl font-black leading-none tracking-tight">{row.name}</h3>
+                      <p className="mt-2 text-sm font-semibold text-slate-200">{team}</p>
+                    </div>
+                  </div>
+                </div>
+                <CardContent className="space-y-4 p-4">
+                  <div className="grid grid-cols-3 gap-2">
+                    <div className="rounded-xl bg-slate-50 p-3">
+                      <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Position</p>
+                      <p className="mt-1 text-sm font-black text-[#0B1F33]">{positionLabel(position)}</p>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 p-3">
+                      <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Age</p>
+                      <p className="mt-1 text-sm font-black text-[#0B1F33]">{profile.age ?? "—"}</p>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 p-3">
+                      <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Team</p>
+                      <p className="mt-1 text-sm font-black text-[#0B1F33]">{team}</p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2 border-t border-slate-100 pt-4 text-center">
+                    <div>
+                      <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Last FP</p>
+                      <p className="font-mono text-lg font-black tabular-nums text-[#0B1F33]">{row.latestFP.toFixed(1)}</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">YoY</p>
+                      <p className={`font-mono text-lg font-black tabular-nums ${row.delta >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                        {row.delta >= 0 ? "+" : ""}{row.delta.toFixed(1)}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Proj FP</p>
+                      <p className="font-mono text-lg font-black tabular-nums text-[#1D6FA5]">{row.projFP.toFixed(1)}</p>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
+      )}
 
       <div className="flex items-center justify-between text-sm">
         <Button variant="outline" size="sm" disabled={page === 0} onClick={() => setPage(page - 1)}>
