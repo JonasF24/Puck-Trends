@@ -880,6 +880,22 @@ function PlayerSearch({ onAdd, disabled, excludeIds }) {
   );
 }
 
+/* ============================= TRADE ANALYZER TAB ============================= */
+function TradeAnalyzer({ weights }) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-lg tracking-tight">Trade Analyzer</CardTitle>
+        <CardDescription>Compare trade options using the current scoring settings.</CardDescription>
+      </CardHeader>
+      <CardContent className="text-sm text-slate-500">
+        Trade Analyzer is ready to use the current scoring settings:{" "}
+        {STAT_DEFS.map(({ key, short }) => `${short} ${weights[key]}`).join(" · ")}.
+      </CardContent>
+    </Card>
+  );
+}
+
 /* ============================= RANKINGS TAB ============================= */
 function RankingsTab({ weights }) {
   const [search, setSearch] = useState("");
@@ -1469,9 +1485,7 @@ export default function App() {
             </aside>
 
             <main className="space-y-4">
-              {tab === "trade" ? (
-                <TradeAnalyzer weights={weights} />
-              ) : tab === "explore" ? (
+              {tab === "explore" && (
                 selected.length === 0 ? (
                   <EmptyExplorerState onTryExample={tryExample} />
                 ) : (
@@ -1483,9 +1497,9 @@ export default function App() {
                     <StatSmallMultiples selected={selected} />
                   </>
                 )
-              ) : (
-                <RankingsTab weights={weights} />
               )}
+              {tab === "rankings" && <RankingsTab weights={weights} />}
+              {tab === "trade" && <TradeAnalyzer weights={weights} />}
             </main>
           </div>
         </div>
