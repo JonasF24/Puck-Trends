@@ -5,7 +5,7 @@ import {
 } from "recharts";
 import {
   Search, TrendingUp, TrendingDown, Info, X, Star, ArrowUpDown, HelpCircle,
-  ChevronDown, Sparkles, Users, Shield
+  ChevronDown, Sparkles, Users, Shield, Menu
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
@@ -1028,6 +1028,7 @@ export default function App() {
   const [weights, setWeights] = useState(DEFAULT_WEIGHTS);
   const [weightsOpen, setWeightsOpen] = useState(false);
   const [tab, setTab] = useState("explore");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [selected, setSelected] = useState([]);
 
   const addPlayer = (p) => {
@@ -1055,16 +1056,62 @@ export default function App() {
               </div>
               <div className="flex items-center gap-2">
                 <HowItWorksPopover />
-                <Tabs value={tab} onValueChange={setTab}>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="md:hidden"
+                  onClick={() => setSidebarOpen((open) => !open)}
+                  aria-label="Open navigation"
+                >
+                  <Menu className="w-4 h-4" />
+                </Button>
+                <Tabs value={tab} onValueChange={setTab} className="hidden md:block">
                   <TabsList>
                     <TabsTrigger value="explore">Player Explorer</TabsTrigger>
                     <TabsTrigger value="rankings">Rankings</TabsTrigger>
+                    <TabsTrigger value="trade">Trade Analyzer</TabsTrigger>
                   </TabsList>
                 </Tabs>
               </div>
             </div>
             <div className="h-px mt-4 bg-gradient-to-r from-transparent via-[#E4572E]/50 to-transparent" />
           </header>
+
+          {sidebarOpen && (
+            <div className="fixed inset-0 z-50 md:hidden">
+              <button
+                type="button"
+                className="absolute inset-0 bg-slate-950/50"
+                onClick={() => setSidebarOpen(false)}
+                aria-label="Close navigation"
+              />
+              <div className="relative h-full w-72 bg-white shadow-xl p-4 space-y-2">
+                <div className="flex items-center justify-between pb-2">
+                  <p className="text-sm font-bold uppercase tracking-tight">Navigation</p>
+                  <Button variant="ghost" size="icon" onClick={() => setSidebarOpen(false)} aria-label="Close navigation">
+                    <X className="w-4 h-4" />
+                  </Button>
+                </div>
+                {[
+                  ["explore", "Player Explorer"],
+                  ["rankings", "Rankings"],
+                  ["trade", "Trade Analyzer"],
+                ].map(([value, label]) => (
+                  <Button
+                    key={value}
+                    variant={tab === value ? "secondary" : "ghost"}
+                    className="w-full justify-start"
+                    onClick={() => {
+                      setTab(value);
+                      setSidebarOpen(false);
+                    }}
+                  >
+                    {label}
+                  </Button>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] gap-5">
             <aside className="space-y-4">
