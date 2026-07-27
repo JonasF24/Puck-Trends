@@ -5,7 +5,7 @@ import {
 } from "recharts";
 import {
   Search, TrendingUp, TrendingDown, Info, X, Star, ArrowUpDown, HelpCircle,
-  ChevronDown, Sparkles, Users, Shield
+  ChevronDown, Sparkles, Users, Shield, Menu
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
@@ -206,6 +206,171 @@ function trendArrow(player, weights) {
   const latest = fp(player.seasons[ordered[0]], weights);
   const prev = fp(player.seasons[ordered[1]], weights);
   return latest - prev;
+}
+
+
+function normalizeScore(value, max = 100) {
+  const num = Number(value);
+  const ceiling = Number(max) || 100;
+  if (!Number.isFinite(num) || ceiling <= 0) return 0;
+  return Math.max(0, Math.min(100, (num / ceiling) * 100));
+}
+
+function estimateAge(player) {
+  // Static player rows do not include birthdates. If a caller enriches the row
+  // with one, use it; otherwise return null so dynasty scoring can stay neutral.
+  return calculateAge(player?.birthDate || player?.birthdate || player?.dateOfBirth);
+}
+
+function getFantasyRating(player, weights) {
+  const projected = projectPlayer(player, weights);
+  return normalizeScore(projected?.fp || 0, 360);
+}
+
+function getCategoryImpact(player, weights) {
+  const stats = projectPlayer(player, weights)?.stats || {};
+  const categories = {};
+  STAT_DEFS.forEach(({ key }) => {
+    const projected = stats[key] || 0;
+    const weighted = projected * (weights[key] || 0);
+    categories[key] = { projected, weighted };
+  });
+  return {
+    stats,
+    categories,
+    totalWeighted: STAT_DEFS.reduce((sum, { key }) => sum + categories[key].weighted, 0),
+    score: normalizeScore(STAT_DEFS.reduce((sum, { key }) => sum + categories[key].weighted, 0), 360),
+  };
+}
+
+function getUsageScore(player) {
+  const latestSeason = getOrderedSeasons(player)[0];
+  const latest = latestSeason ? player.seasons[latestSeason] : null;
+  if (!latest) return 0;
+  const avgToi = latest.gp > 0 ? latest.toi / latest.gp : 0;
+  return 0.7 * normalizeScore(avgToi, 22) + 0.3 * normalizeScore(latest.gp, 82);
+}
+
+function getTrendScore(player, weights) {
+  const trend = trendArrow(player, weights);
+  return Math.max(0, Math.min(100, 50 + trend / 2));
+}
+
+function getRiskScore(player, weights) {
+  const projected = projectPlayer(player, weights);
+  const gpScore = normalizeScore(projected?.stats?.gp || 0, 82);
+  const volatilityScore = 100 - normalizeScore(projected?.stdev || 0, 120);
+  const trend = trendArrow(player, weights);
+  const trendSafety = trend < 0 ? 100 - normalizeScore(Math.abs(trend), 80) : 100;
+  return 0.45 * gpScore + 0.35 * volatilityScore + 0.2 * trendSafety;
+}
+
+function getDynastyScore(player, weights, mode = "redraft") {
+  const fantasy = getFantasyRating(player, weights);
+  const trend = getTrendScore(player, weights);
+  if (mode !== "dynasty") return 0.8 * fantasy + 0.2 * trend;
+
+  const age = estimateAge(player);
+  const ageScore = age == null ? 50 : age <= 23 ? 100 : age <= 27 ? 85 : age <= 30 ? 65 : age <= 33 ? 40 : 20;
+  return {
+    score: 0.55 * fantasy + 0.25 * ageScore + 0.2 * trend,
+    age,
+    ageScore,
+    ageNeutral: age == null,
+    note: age == null ? "Birthdates are unavailable in the static dataset, so age is scored neutrally." : null,
+  };
+}
+
+function evaluateTradeAsset(asset, weights, mode = "redraft") {
+  if (!asset) return null;
+
+  if (asset.type === "pick") {
+    const round = Math.max(1, Number(asset.round) || 1);
+    const year = Number(asset.year) || Number(SEASONS[SEASONS.length - 1]) + 1;
+    const currentYear = Number(SEASONS[SEASONS.length - 1]) + 1;
+    const baseByRound = { 1: 70, 2: 45, 3: 28, 4: 18, 5: 12, 6: 8, 7: 5 };
+    const delayPenalty = Math.max(0, year - currentYear) * 5;
+    const score = Math.max(2, (baseByRound[round] || 4) - delayPenalty) * (mode === "dynasty" ? 1.2 : 0.75);
+    return {
+      asset,
+      label: `${year} Round ${round} Pick`,
+      value: score,
+      score: normalizeScore(score),
+      categoryTotals: {},
+      risk: mode === "dynasty" ? 55 : 40,
+      confidence: 45,
+      components: { pick: score },
+    };
+  }
+
+  if (asset.type !== "player" || !asset.player) return null;
+
+  const player = asset.player;
+  const fantasy = getFantasyRating(player, weights);
+  const category = getCategoryImpact(player, weights);
+  const dynasty = getDynastyScore(player, weights, mode);
+  const dynastyScore = typeof dynasty === "number" ? dynasty : dynasty.score;
+  const usage = getUsageScore(player);
+  const trend = getTrendScore(player, weights);
+  const risk = getRiskScore(player, weights);
+  const score = 0.35 * fantasy + 0.2 * category.score + 0.15 * dynastyScore + 0.1 * usage + 0.1 * trend + 0.1 * risk;
+
+  return {
+    asset,
+    label: player.name,
+    value: score,
+    score,
+    categoryTotals: category.stats,
+    risk,
+    confidence: 0.6 * risk + 0.4 * normalizeScore(projectPlayer(player, weights)?.stats?.gp || 0, 82),
+    components: { fantasy, category: category.score, dynasty: dynastyScore, usage, trend, risk },
+    dynasty,
+  };
+}
+
+function evaluateTradePackage(assets = [], weights, mode = "redraft") {
+  const evaluations = assets.map((asset) => evaluateTradeAsset(asset, weights, mode)).filter(Boolean);
+  const categoryTotals = {};
+  STAT_DEFS.forEach(({ key }) => {
+    categoryTotals[key] = evaluations.reduce((sum, evaluation) => sum + (evaluation.categoryTotals[key] || 0), 0);
+  });
+  const totalValue = evaluations.reduce((sum, evaluation) => sum + evaluation.value, 0);
+  const risk = evaluations.length ? evaluations.reduce((sum, evaluation) => sum + evaluation.risk, 0) / evaluations.length : 0;
+  const confidence = evaluations.length ? evaluations.reduce((sum, evaluation) => sum + evaluation.confidence, 0) / evaluations.length : 0;
+  return { totalValue, categoryTotals, risk, confidence, assets: evaluations };
+}
+
+function evaluateTrade(sideA = [], sideB = [], weights = DEFAULT_WEIGHTS, mode = "redraft") {
+  const a = evaluateTradePackage(sideA, weights, mode);
+  const b = evaluateTradePackage(sideB, weights, mode);
+  const diff = b.totalValue - a.totalValue;
+  const pct = a.totalValue > 0 ? (diff / a.totalValue) * 100 : diff;
+  const score = Math.max(0, Math.min(100, 50 + pct));
+  const verdict = pct >= 25 ? "Strong Accept" : pct >= 8 ? "Accept" : pct >= -7 ? "Fair" : pct >= -18 ? "Slight Overpay" : "Reject";
+  const categoryDeltas = {};
+  STAT_DEFS.forEach(({ key }) => {
+    categoryDeltas[key] = (b.categoryTotals[key] || 0) - (a.categoryTotals[key] || 0);
+  });
+  const outgoingNames = new Set(sideA.filter((asset) => asset?.type === "player").map((asset) => asset.player?.id));
+  const alternativeTargets = verdict === "Reject"
+    ? PLAYER_DATA.map((player) => evaluateTradeAsset({ type: "player", player }, weights, mode))
+        .filter((evaluation) => evaluation && !outgoingNames.has(evaluation.asset.player.id) && evaluation.value >= a.totalValue * 0.9)
+        .sort((x, y) => Math.abs(x.value - a.totalValue) - Math.abs(y.value - a.totalValue))
+        .slice(0, 5)
+        .map(({ asset, value, components }) => ({ player: asset.player, value, components }))
+    : [];
+
+  return {
+    verdict,
+    score,
+    confidence: Math.min(a.confidence, b.confidence),
+    sideA: a,
+    sideB: b,
+    deltas: { value: diff, percent: pct, risk: b.risk - a.risk, confidence: b.confidence - a.confidence },
+    categoryDeltas,
+    riskSummary: { sideA: a.risk, sideB: b.risk, saferSide: a.risk === b.risk ? "Even" : a.risk > b.risk ? "Side A" : "Side B" },
+    alternativeTargets,
+  };
 }
 
 /* ============================= SHARED BITS ============================= */
@@ -1039,11 +1204,169 @@ function HowItWorksPopover() {
   );
 }
 
+
+/* ============================= TRADE ANALYZER ============================= */
+const TRADE_PICK_YEARS = ["2026", "2027", "2028", "2029"];
+const TRADE_PICK_ROUNDS = ["1", "2", "3", "4", "5", "6", "7"];
+const TRADE_STAT_KEYS = ["g", "a", "ppp", "sog", "hit", "blk"];
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function tradeTrendLabel(player, weights) {
+  const delta = trendArrow(player, weights);
+  if (delta > 12) return "Rising";
+  if (delta < -12) return "Falling";
+  return "Stable";
+}
+
+function tradeRiskLabel(stdev) {
+  if (stdev > 35) return "High";
+  if (stdev > 18) return "Medium";
+  return "Low";
+}
+
+function pickValue(pick, mode) {
+  const yearPenalty = Math.max(0, Number(pick.year) - Number(TRADE_PICK_YEARS[0])) * 4;
+  const base = { "1": 70, "2": 42, "3": 26, "4": 16, "5": 10, "6": 6, "7": 3 }[pick.round] || 0;
+  return Math.max(1, base - yearPenalty) * (mode === "dynasty" ? 1.25 : 0.45);
+}
+
+function analyzeTradeSide(players, picks, weights, mode) {
+  const playerRows = players.map((player) => {
+    const proj = projectPlayer(player, weights) || { stats: {}, fp: 0, stdev: 0 };
+    const trend = tradeTrendLabel(player, weights);
+    const risk = tradeRiskLabel(proj.stdev);
+    const dynastyValue = proj.fp * (mode === "dynasty" ? 1.08 : 0.75) + (trend === "Rising" ? 8 : trend === "Falling" ? -8 : 0) - proj.stdev * 0.12;
+    return { type: "player", player, proj, trend, risk, value: proj.fp, dynastyValue };
+  });
+  const pickRows = picks.map((pick) => ({ type: "pick", pick, value: pickValue(pick, mode), dynastyValue: pickValue(pick, "dynasty") }));
+  const stats = Object.fromEntries(TRADE_STAT_KEYS.map((key) => [key, 0]));
+  playerRows.forEach(({ proj }) => TRADE_STAT_KEYS.forEach((key) => { stats[key] += proj.stats[key] || 0; }));
+  const projected = playerRows.reduce((sum, row) => sum + row.proj.fp, 0);
+  const pickTotal = pickRows.reduce((sum, row) => sum + row.value, 0);
+  const dynastyTotal = playerRows.reduce((sum, row) => sum + row.dynastyValue, 0) + pickRows.reduce((sum, row) => sum + row.dynastyValue, 0);
+  const riskScore = playerRows.length ? playerRows.reduce((sum, row) => sum + row.proj.stdev, 0) / playerRows.length : 0;
+  return { players: playerRows, picks: pickRows, stats, projected, pickTotal, total: projected + pickTotal, dynastyTotal, riskScore };
+}
+
+function TradeAnalyzer({ weights }) {
+  const [mode, setMode] = useState("redraft");
+  const [sideA, setSideA] = useState([]);
+  const [sideB, setSideB] = useState([]);
+  const [picksA, setPicksA] = useState([]);
+  const [picksB, setPicksB] = useState([]);
+  const [pickFormA, setPickFormA] = useState({ year: TRADE_PICK_YEARS[0], round: "1" });
+  const [pickFormB, setPickFormB] = useState({ year: TRADE_PICK_YEARS[0], round: "1" });
+
+  const analysis = useMemo(() => {
+    const a = analyzeTradeSide(sideA, picksA, weights, mode);
+    const b = analyzeTradeSide(sideB, picksB, weights, mode);
+    const valueA = mode === "dynasty" ? a.dynastyTotal : a.total;
+    const valueB = mode === "dynasty" ? b.dynastyTotal : b.total;
+    const gap = valueB - valueA;
+    const absGap = Math.abs(gap);
+    const score = clamp(Math.round(50 + gap), 0, 100);
+    let verdict = "Even";
+    let action = "Renegotiate";
+    if (gap >= 20) { verdict = "Accept"; action = "Accept"; }
+    else if (gap >= 6) { verdict = "Slight Win"; action = "Accept"; }
+    else if (gap <= -20) { verdict = "Reject"; action = "Reject"; }
+    else if (gap <= -6) { verdict = "Slight Overpay"; action = "Renegotiate"; }
+    const confidence = absGap > 35 ? "High" : absGap > 12 ? "Medium" : "Low";
+    const categoryDiffs = TRADE_STAT_KEYS.map((key) => ({ key, diff: b.stats[key] - a.stats[key] })).sort((x, y) => Math.abs(y.diff) - Math.abs(x.diff));
+    const targets = PLAYER_DATA.map((player) => {
+      const proj = projectPlayer(player, weights);
+      if (!proj || sideA.concat(sideB).some((p) => p.id === player.id)) return null;
+      return { player, proj, risk: tradeRiskLabel(proj.stdev) };
+    }).filter(Boolean)
+      .filter((row) => row.risk !== "High" && row.proj.fp <= absGap + 18)
+      .sort((x, y) => Math.abs(x.proj.fp - absGap) - Math.abs(y.proj.fp - absGap) || x.proj.stdev - y.proj.stdev)
+      .slice(0, 4);
+    return { a, b, valueA, valueB, gap, score, verdict, action, confidence, categoryDiffs, targets };
+  }, [mode, sideA, sideB, picksA, picksB, weights]);
+
+  const addPick = (side) => {
+    if (side === "A") setPicksA([...picksA, { ...pickFormA, id: `A-${Date.now()}` }]);
+    else setPicksB([...picksB, { ...pickFormB, id: `B-${Date.now()}` }]);
+  };
+
+  const renderBuilder = (title, players, setPlayers, picks, setPicks, form, setForm, side) => (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm uppercase tracking-tight">{title}</CardTitle>
+        <CardDescription>Add skaters and draft picks to this side.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <PlayerSearch onAdd={(p) => setPlayers([...players, p])} disabled={players.length >= 8} excludeIds={players.map((p) => p.id)} />
+        <div className="flex flex-wrap gap-2">
+          {players.map((p, i) => <PlayerChip key={p.id} player={p} color={PLAYER_COLORS[i % PLAYER_COLORS.length]} onRemove={() => setPlayers(players.filter((x) => x.id !== p.id))} />)}
+          {players.length === 0 && <span className="text-xs text-slate-400">No players added.</span>}
+        </div>
+        <Separator />
+        <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
+          <Select value={form.year} onValueChange={(year) => setForm({ ...form, year })}><SelectTrigger><SelectValue placeholder="Year" /></SelectTrigger><SelectContent><SelectGroup>{TRADE_PICK_YEARS.map((y) => <SelectItem key={y} value={y}>{y}</SelectItem>)}</SelectGroup></SelectContent></Select>
+          <Select value={form.round} onValueChange={(round) => setForm({ ...form, round })}><SelectTrigger><SelectValue placeholder="Round" /></SelectTrigger><SelectContent><SelectGroup>{TRADE_PICK_ROUNDS.map((r) => <SelectItem key={r} value={r}>Round {r}</SelectItem>)}</SelectGroup></SelectContent></Select>
+          <Button onClick={() => addPick(side)}>Add pick</Button>
+        </div>
+        <div className="space-y-2">
+          {picks.map((pick) => <div key={pick.id} className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2 text-sm"><span className="font-semibold">{pick.year} Round {pick.round}</span><button onClick={() => setPicks(picks.filter((x) => x.id !== pick.id))} className="text-slate-400 hover:text-rose-600"><X className="w-4 h-4" /></button></div>)}
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  const renderSideSummary = (label, side) => (
+    <div className="rounded-xl border border-slate-200 bg-white p-4">
+      <h3 className="font-black text-[#0B1F33]">{label}</h3>
+      <div className="grid grid-cols-2 gap-2 mt-3 text-sm">
+        <div><p className="text-[10px] uppercase text-slate-400 font-bold">Package value</p><p className="text-xl font-black">{(mode === "dynasty" ? side.dynastyTotal : side.total).toFixed(1)}</p></div>
+        <div><p className="text-[10px] uppercase text-slate-400 font-bold">Projected FP</p><p className="text-xl font-black">{side.projected.toFixed(1)}</p></div>
+      </div>
+      <div className="grid grid-cols-3 gap-2 mt-3">{TRADE_STAT_KEYS.map((key) => <div key={key} className="rounded bg-slate-50 p-2"><p className="text-[10px] font-bold text-slate-400 uppercase">{key.toUpperCase()}</p><p className="font-black">{side.stats[key].toFixed(1)}</p></div>)}</div>
+      <p className="text-xs text-slate-500 mt-3">Risk averages {tradeRiskLabel(side.riskScore).toLowerCase()}; trend mix is {side.players.map((p) => p.trend.toLowerCase()).join(", ") || "pick-driven"}.</p>
+    </div>
+  );
+
+  const allAssets = [...analysis.a.players, ...analysis.b.players];
+  const bestCats = analysis.categoryDiffs.slice(0, 2).map(({ key, diff }) => `${diff >= 0 ? "gain" : "lose"} ${Math.abs(diff).toFixed(1)} ${key.toUpperCase()}`).join(" and ") || "minimal category movement";
+
+  return (
+    <div className="space-y-4">
+      <Card className="bg-[#0B1F33] text-white border-0">
+        <CardHeader>
+          <div className="flex items-start justify-between gap-3 flex-wrap">
+            <div><CardTitle className="text-2xl font-black uppercase">Fantasy Hockey Trade Analyzer</CardTitle><CardDescription className="text-slate-300">Scoring uses the current league scoring settings from the left panel.</CardDescription></div>
+            <Tabs value={mode} onValueChange={setMode}><TabsList><TabsTrigger value="redraft">Redraft</TabsTrigger><TabsTrigger value="dynasty">Dynasty</TabsTrigger></TabsList></Tabs>
+          </div>
+        </CardHeader>
+      </Card>
+
+      <div className="grid md:grid-cols-2 gap-4">
+        {renderBuilder("You Give", sideA, setSideA, picksA, setPicksA, pickFormA, setPickFormA, "A")}
+        {renderBuilder("You Receive", sideB, setSideB, picksB, setPicksB, pickFormB, setPickFormB, "B")}
+      </div>
+
+      <Alert className="border-[#E4572E]/40 bg-white"><Shield className="w-4 h-4" /><AlertTitle>{analysis.verdict} — {analysis.action}</AlertTitle><AlertDescription>Trade score: <strong>{analysis.score}/100</strong>. Confidence: <strong>{analysis.confidence}</strong>. Value gap: <strong>{analysis.gap >= 0 ? "+" : ""}{analysis.gap.toFixed(1)}</strong> toward what you receive.</AlertDescription></Alert>
+
+      <div className="grid md:grid-cols-2 gap-4">{renderSideSummary("You Give", analysis.a)}{renderSideSummary("You Receive", analysis.b)}</div>
+
+      <Card><CardHeader><CardTitle className="text-sm uppercase tracking-tight">Individual assets</CardTitle></CardHeader><CardContent className="grid md:grid-cols-2 gap-3">{allAssets.length ? allAssets.map(({ player, proj, trend, risk, dynastyValue }) => <div key={player.id} className="rounded-xl border border-slate-200 p-3"><div className="flex items-center justify-between"><div><p className="font-black">{player.name}</p><p className="text-xs text-slate-500">{player.position} · {player.team}</p></div><Badge className="bg-[#1D6FA5]">{proj.fp.toFixed(1)} FP</Badge></div><div className="grid grid-cols-2 gap-2 mt-3 text-xs"><p><strong>Trend:</strong> {trend}</p><p><strong>Risk:</strong> {risk}</p><p><strong>ROS value:</strong> {proj.fp.toFixed(1)}</p><p><strong>Dynasty:</strong> {dynastyValue.toFixed(1)}</p></div><p className="text-xs text-slate-500 mt-2">Age curve note: this dataset has no birthdates, so age limitation is estimated from production trend and volatility rather than exact age.</p></div>) : <p className="text-sm text-slate-500">Add players to see individual asset cards.</p>}</CardContent></Card>
+
+      <Card><CardHeader><CardTitle className="text-sm uppercase tracking-tight">AI-style explanation</CardTitle></CardHeader><CardContent className="space-y-2 text-sm text-slate-600 leading-relaxed"><p>This deal grades as <strong>{analysis.verdict}</strong> because the incoming package is worth {analysis.valueB.toFixed(1)} versus {analysis.valueA.toFixed(1)} going out. The biggest category movement is {bestCats}, which drives the roster-impact read more than name value.</p><p>The strengths are concentrated in projected fantasy production, deployment context through team offense and power-play environment, and recent trend. Weaknesses come from volatility: higher-risk assets have wider projected ranges and should be discounted when the value gap is small.</p><p>{mode === "dynasty" ? "Dynasty mode puts extra weight on long-term value, picks, prospect-style profiles, trend growth, and age-curve uncertainty. If you are giving up established production for picks, make sure the long-term upside clears the current fantasy production lost." : "Redraft mode emphasizes rest-of-season points, category fit, deployment, regression toward recent history, and immediate roster impact over future pick value."}</p></CardContent></Card>
+
+      {(analysis.verdict === "Reject" || analysis.verdict === "Slight Overpay") && <Card><CardHeader><CardTitle className="text-sm uppercase tracking-tight">Recommendations</CardTitle><CardDescription>Lower-risk targets near the trade gap.</CardDescription></CardHeader><CardContent className="grid md:grid-cols-2 gap-2">{analysis.targets.map(({ player, proj, risk }) => <div key={player.id} className="rounded-lg bg-slate-50 p-3 flex items-center justify-between"><span className="font-semibold">{player.name} <span className="text-xs text-slate-400">{player.position} · {player.team}</span></span><Badge variant="secondary">{proj.fp.toFixed(1)} FP · {risk}</Badge></div>)}</CardContent></Card>}
+    </div>
+  );
+}
+
 /* ============================= MAIN APP ============================= */
 export default function App() {
   const [weights, setWeights] = useState(DEFAULT_WEIGHTS);
   const [weightsOpen, setWeightsOpen] = useState(false);
   const [tab, setTab] = useState("explore");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [selected, setSelected] = useState([]);
 
   const addPlayer = (p) => {
@@ -1071,7 +1394,16 @@ export default function App() {
               </div>
               <div className="flex items-center gap-2">
                 <HowItWorksPopover />
-                <Tabs value={tab} onValueChange={setTab}>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="md:hidden"
+                  onClick={() => setSidebarOpen((open) => !open)}
+                  aria-label="Open navigation"
+                >
+                  <Menu className="w-4 h-4" />
+                </Button>
+                <Tabs value={tab} onValueChange={setTab} className="hidden md:block">
                   <TabsList>
                     <TabsTrigger value="explore">Player Explorer</TabsTrigger>
                     <TabsTrigger value="rankings">Rankings</TabsTrigger>
@@ -1082,6 +1414,42 @@ export default function App() {
             </div>
             <div className="h-px mt-4 bg-gradient-to-r from-transparent via-[#E4572E]/50 to-transparent" />
           </header>
+
+          {sidebarOpen && (
+            <div className="fixed inset-0 z-50 md:hidden">
+              <button
+                type="button"
+                className="absolute inset-0 bg-slate-950/50"
+                onClick={() => setSidebarOpen(false)}
+                aria-label="Close navigation"
+              />
+              <div className="relative h-full w-72 bg-white shadow-xl p-4 space-y-2">
+                <div className="flex items-center justify-between pb-2">
+                  <p className="text-sm font-bold uppercase tracking-tight">Navigation</p>
+                  <Button variant="ghost" size="icon" onClick={() => setSidebarOpen(false)} aria-label="Close navigation">
+                    <X className="w-4 h-4" />
+                  </Button>
+                </div>
+                {[
+                  ["explore", "Player Explorer"],
+                  ["rankings", "Rankings"],
+                  ["trade", "Trade Analyzer"],
+                ].map(([value, label]) => (
+                  <Button
+                    key={value}
+                    variant={tab === value ? "secondary" : "ghost"}
+                    className="w-full justify-start"
+                    onClick={() => {
+                      setTab(value);
+                      setSidebarOpen(false);
+                    }}
+                  >
+                    {label}
+                  </Button>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] gap-5">
             <aside className="space-y-4">
