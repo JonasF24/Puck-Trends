@@ -208,6 +208,171 @@ function trendArrow(player, weights) {
   return latest - prev;
 }
 
+
+function normalizeScore(value, max = 100) {
+  const num = Number(value);
+  const ceiling = Number(max) || 100;
+  if (!Number.isFinite(num) || ceiling <= 0) return 0;
+  return Math.max(0, Math.min(100, (num / ceiling) * 100));
+}
+
+function estimateAge(player) {
+  // Static player rows do not include birthdates. If a caller enriches the row
+  // with one, use it; otherwise return null so dynasty scoring can stay neutral.
+  return calculateAge(player?.birthDate || player?.birthdate || player?.dateOfBirth);
+}
+
+function getFantasyRating(player, weights) {
+  const projected = projectPlayer(player, weights);
+  return normalizeScore(projected?.fp || 0, 360);
+}
+
+function getCategoryImpact(player, weights) {
+  const stats = projectPlayer(player, weights)?.stats || {};
+  const categories = {};
+  STAT_DEFS.forEach(({ key }) => {
+    const projected = stats[key] || 0;
+    const weighted = projected * (weights[key] || 0);
+    categories[key] = { projected, weighted };
+  });
+  return {
+    stats,
+    categories,
+    totalWeighted: STAT_DEFS.reduce((sum, { key }) => sum + categories[key].weighted, 0),
+    score: normalizeScore(STAT_DEFS.reduce((sum, { key }) => sum + categories[key].weighted, 0), 360),
+  };
+}
+
+function getUsageScore(player) {
+  const latestSeason = getOrderedSeasons(player)[0];
+  const latest = latestSeason ? player.seasons[latestSeason] : null;
+  if (!latest) return 0;
+  const avgToi = latest.gp > 0 ? latest.toi / latest.gp : 0;
+  return 0.7 * normalizeScore(avgToi, 22) + 0.3 * normalizeScore(latest.gp, 82);
+}
+
+function getTrendScore(player, weights) {
+  const trend = trendArrow(player, weights);
+  return Math.max(0, Math.min(100, 50 + trend / 2));
+}
+
+function getRiskScore(player, weights) {
+  const projected = projectPlayer(player, weights);
+  const gpScore = normalizeScore(projected?.stats?.gp || 0, 82);
+  const volatilityScore = 100 - normalizeScore(projected?.stdev || 0, 120);
+  const trend = trendArrow(player, weights);
+  const trendSafety = trend < 0 ? 100 - normalizeScore(Math.abs(trend), 80) : 100;
+  return 0.45 * gpScore + 0.35 * volatilityScore + 0.2 * trendSafety;
+}
+
+function getDynastyScore(player, weights, mode = "redraft") {
+  const fantasy = getFantasyRating(player, weights);
+  const trend = getTrendScore(player, weights);
+  if (mode !== "dynasty") return 0.8 * fantasy + 0.2 * trend;
+
+  const age = estimateAge(player);
+  const ageScore = age == null ? 50 : age <= 23 ? 100 : age <= 27 ? 85 : age <= 30 ? 65 : age <= 33 ? 40 : 20;
+  return {
+    score: 0.55 * fantasy + 0.25 * ageScore + 0.2 * trend,
+    age,
+    ageScore,
+    ageNeutral: age == null,
+    note: age == null ? "Birthdates are unavailable in the static dataset, so age is scored neutrally." : null,
+  };
+}
+
+function evaluateTradeAsset(asset, weights, mode = "redraft") {
+  if (!asset) return null;
+
+  if (asset.type === "pick") {
+    const round = Math.max(1, Number(asset.round) || 1);
+    const year = Number(asset.year) || Number(SEASONS[SEASONS.length - 1]) + 1;
+    const currentYear = Number(SEASONS[SEASONS.length - 1]) + 1;
+    const baseByRound = { 1: 70, 2: 45, 3: 28, 4: 18, 5: 12, 6: 8, 7: 5 };
+    const delayPenalty = Math.max(0, year - currentYear) * 5;
+    const score = Math.max(2, (baseByRound[round] || 4) - delayPenalty) * (mode === "dynasty" ? 1.2 : 0.75);
+    return {
+      asset,
+      label: `${year} Round ${round} Pick`,
+      value: score,
+      score: normalizeScore(score),
+      categoryTotals: {},
+      risk: mode === "dynasty" ? 55 : 40,
+      confidence: 45,
+      components: { pick: score },
+    };
+  }
+
+  if (asset.type !== "player" || !asset.player) return null;
+
+  const player = asset.player;
+  const fantasy = getFantasyRating(player, weights);
+  const category = getCategoryImpact(player, weights);
+  const dynasty = getDynastyScore(player, weights, mode);
+  const dynastyScore = typeof dynasty === "number" ? dynasty : dynasty.score;
+  const usage = getUsageScore(player);
+  const trend = getTrendScore(player, weights);
+  const risk = getRiskScore(player, weights);
+  const score = 0.35 * fantasy + 0.2 * category.score + 0.15 * dynastyScore + 0.1 * usage + 0.1 * trend + 0.1 * risk;
+
+  return {
+    asset,
+    label: player.name,
+    value: score,
+    score,
+    categoryTotals: category.stats,
+    risk,
+    confidence: 0.6 * risk + 0.4 * normalizeScore(projectPlayer(player, weights)?.stats?.gp || 0, 82),
+    components: { fantasy, category: category.score, dynasty: dynastyScore, usage, trend, risk },
+    dynasty,
+  };
+}
+
+function evaluateTradePackage(assets = [], weights, mode = "redraft") {
+  const evaluations = assets.map((asset) => evaluateTradeAsset(asset, weights, mode)).filter(Boolean);
+  const categoryTotals = {};
+  STAT_DEFS.forEach(({ key }) => {
+    categoryTotals[key] = evaluations.reduce((sum, evaluation) => sum + (evaluation.categoryTotals[key] || 0), 0);
+  });
+  const totalValue = evaluations.reduce((sum, evaluation) => sum + evaluation.value, 0);
+  const risk = evaluations.length ? evaluations.reduce((sum, evaluation) => sum + evaluation.risk, 0) / evaluations.length : 0;
+  const confidence = evaluations.length ? evaluations.reduce((sum, evaluation) => sum + evaluation.confidence, 0) / evaluations.length : 0;
+  return { totalValue, categoryTotals, risk, confidence, assets: evaluations };
+}
+
+function evaluateTrade(sideA = [], sideB = [], weights = DEFAULT_WEIGHTS, mode = "redraft") {
+  const a = evaluateTradePackage(sideA, weights, mode);
+  const b = evaluateTradePackage(sideB, weights, mode);
+  const diff = b.totalValue - a.totalValue;
+  const pct = a.totalValue > 0 ? (diff / a.totalValue) * 100 : diff;
+  const score = Math.max(0, Math.min(100, 50 + pct));
+  const verdict = pct >= 25 ? "Strong Accept" : pct >= 8 ? "Accept" : pct >= -7 ? "Fair" : pct >= -18 ? "Slight Overpay" : "Reject";
+  const categoryDeltas = {};
+  STAT_DEFS.forEach(({ key }) => {
+    categoryDeltas[key] = (b.categoryTotals[key] || 0) - (a.categoryTotals[key] || 0);
+  });
+  const outgoingNames = new Set(sideA.filter((asset) => asset?.type === "player").map((asset) => asset.player?.id));
+  const alternativeTargets = verdict === "Reject"
+    ? PLAYER_DATA.map((player) => evaluateTradeAsset({ type: "player", player }, weights, mode))
+        .filter((evaluation) => evaluation && !outgoingNames.has(evaluation.asset.player.id) && evaluation.value >= a.totalValue * 0.9)
+        .sort((x, y) => Math.abs(x.value - a.totalValue) - Math.abs(y.value - a.totalValue))
+        .slice(0, 5)
+        .map(({ asset, value, components }) => ({ player: asset.player, value, components }))
+    : [];
+
+  return {
+    verdict,
+    score,
+    confidence: Math.min(a.confidence, b.confidence),
+    sideA: a,
+    sideB: b,
+    deltas: { value: diff, percent: pct, risk: b.risk - a.risk, confidence: b.confidence - a.confidence },
+    categoryDeltas,
+    riskSummary: { sideA: a.risk, sideB: b.risk, saferSide: a.risk === b.risk ? "Even" : a.risk > b.risk ? "Side A" : "Side B" },
+    alternativeTargets,
+  };
+}
+
 /* ============================= SHARED BITS ============================= */
 
 // Small info-dot tooltip. Veterans can ignore it; beginners get a plain-language
